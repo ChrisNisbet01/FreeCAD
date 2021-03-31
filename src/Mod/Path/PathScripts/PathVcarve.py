@@ -30,6 +30,7 @@ import PathScripts.PathOp as PathOp
 import PathScripts.PathUtils as PathUtils
 import PathScripts.PathGeom as PathGeom
 import PathScripts.PathPreferences as PathPreferences
+import PathScripts.PathWidthToDepth as PathWidthToDepth
 
 import traceback
 
@@ -157,44 +158,19 @@ def _sortVoronoiWires(wires, start=FreeCAD.Vector(0, 0, 0)):
 
     return result
 
-class _Geometry(object):
-    '''POD class so the limits only have to be calculated once.'''
-
-    def __init__(self, zStart, zStop, zScale):
-        self.start = zStart
-        self.stop  = zStop
-        self.scale = zScale
-
-    @classmethod
-    def FromTool(cls, tool, zStart, zFinal):
-        rMax = float(tool.Diameter) / 2.0
-        rMin = float(tool.TipDiameter) / 2.0
-        toolangle = math.tan(math.radians(tool.CuttingEdgeAngle.Value / 2.0))
-        zScale = 1.0 / toolangle
-        zStop  = zStart - rMax * zScale
-        zOff   = rMin * zScale
-
-        return _Geometry(zStart + zOff, max(zStop + zOff, zFinal), zScale)
-
-    @classmethod
-    def FromObj(cls, obj, model):
-        zStart = model.Shape.BoundBox.ZMax
-        finalDepth = obj.FinalDepth.Value
-
-        return cls.FromTool(obj.ToolController.Tool, zStart, finalDepth)
-
-def _calculate_depth(MIC, geom):
+def _calculate_depth(MIC, width_to_depth_calculator):
     # given a maximum inscribed circle (MIC) and tool angle,
     # return depth of cut relative to zStart.
-    depth = geom.start - round(MIC / geom.scale, 4)
-    PathLog.debug('zStart value: {} depth: {}'.format(geom.start, depth))
+    depth = round(width_to_depth_calculator.WidthToDepth(MIC), 4)
+    PathLog.debug('depth: {}'.format(depth))
 
-    return max(depth, geom.stop)
+    return depth
 
-def _getPartEdge(edge, depths):
+def _getPartEdge(edge, width_to_depth_calculator):
     dist = edge.getDistances()
-    zBegin = _calculate_depth(dist[0], depths)
-    zEnd   = _calculate_depth(dist[1], depths)
+    zBegin = _calculate_depth(dist[0], width_to_depth_calculator)
+    zEnd = _calculate_depth(dist[1], width_to_depth_calculator)
+
     return edge.toShape(zBegin, zEnd)
 
 class ObjectVcarve(PathEngraveBase.ObjectOp):
@@ -231,19 +207,54 @@ class ObjectVcarve(PathEngraveBase.ObjectOp):
         # upgrade ...
         self.setupAdditionalProperties(obj)
 
-    def _getPartEdges(self, obj, vWire, geom):
+    def _getPartEdges(self, obj, vWire, width_to_depth_calculator):
+        def simplify_edges(edges):
+            def median(v1, v2):
+                vd = v2.sub(v1)
+                vd.scale(0.5, 0.5, 0.5)
+                return v1.add(vd)
+
+            points = []
+            # It appears that the LastParameter of each point is the same as the FirstParameter
+            # of the next, so don't bother duplicating these points.
+            points.append(edges[0].valueAt(edges[0].FirstParameter))
+            for partEdge in edges:
+                points.append(partEdge.valueAt(partEdge.LastParameter))
+
+            simplified_points = PathUtils.simplify3dLine(points)
+
+            # An even number of points is required so that they can be divided into pairs
+            # that are then used to create line segments.
+            if len(simplified_points) % 2 != 0:
+                m = median(simplified_points[-2], simplified_points[-1])
+                simplified_points.insert(-1, m)
+
+            simplified_edges = []
+            for i in range(0, len(simplified_points) - 1, 2):
+                p1 = simplified_points[i]
+                p2 = simplified_points[i + 1]
+                simplified_edges.append(Part.LineSegment(p1, p2).toShape())
+
+            return simplified_edges
+
         edges = []
         for e in vWire:
-            edges.append(_getPartEdge(e, geom))
-        return edges
+            edges.append(_getPartEdge(e, width_to_depth_calculator))
 
-    def buildPathMedial(self, obj, faces):
+        return simplify_edges(edges)
+
+    def buildPathMedial(self, obj, width_to_depth_calculator, faces):
         '''constructs a medial axis path using openvoronoi'''
 
-        def insert_many_wires(vd, wires):
+        def insert_many_wires(vd, wires, bitIsLinear):
             for wire in wires:
                 PathLog.debug('discretize value: {}'.format(obj.Discretize))
-                pts = wire.discretize(QuasiDeflection=obj.Discretize)
+                # Non-linear bits (e.g. ballend mills) need the lines to be split into smaller lengths
+                # else they wind up cutting deeper than they should for a given width.
+                if bitIsLinear:
+                    pts = wire.discretize(QuasiDeflection=obj.Discretize)
+                else:
+                    pts = wire.discretize(obj.Discretize * 10.0)
                 ptv = [FreeCAD.Vector(p.x, p.y) for p in pts]
                 ptv.append(ptv[0])
 
@@ -268,7 +279,7 @@ class ObjectVcarve(PathEngraveBase.ObjectOp):
         voronoiWires = []
         for f in faces:
             vd = Path.Voronoi()
-            insert_many_wires(vd, f.Wires)
+            insert_many_wires(vd, f.Wires, width_to_depth_calculator.IsLinear)
 
             vd.construct()
 
@@ -290,12 +301,10 @@ class ObjectVcarve(PathEngraveBase.ObjectOp):
         if _sorting == 'global':
             voronoiWires = _sortVoronoiWires(voronoiWires)
 
-        geom = _Geometry.FromObj(obj, self.model[0])
-
         pathlist = []
         pathlist.append(Path.Command("(starting)"))
         for w in voronoiWires:
-            pWire = self._getPartEdges(obj, w, geom)
+            pWire = self._getPartEdges(obj, w, width_to_depth_calculator)
             if pWire:
                 wires.append(pWire)
                 pathlist.extend(cutWire(pWire))
@@ -305,11 +314,14 @@ class ObjectVcarve(PathEngraveBase.ObjectOp):
         '''opExecute(obj) ... process engraving operation'''
         PathLog.track()
 
-        if not hasattr(obj.ToolController.Tool, "CuttingEdgeAngle"):
-            PathLog.error(translate("Path_Vcarve", "VCarve requires an engraving cutter with CuttingEdgeAngle"))
+        tool = obj.ToolController.Tool
+        width_to_depth_calculator = PathWidthToDepth.WidthToDepthCalculator(
+                tool, tool.BitShape, self.model[0].Shape.BoundBox.ZMax, obj.FinalDepth.Value)
 
-        if obj.ToolController.Tool.CuttingEdgeAngle >= 180.0:
-            PathLog.error(translate("Path_Vcarve", "Engraver Cutting Edge Angle must be < 180 degrees."))
+        if not width_to_depth_calculator.SupportsVcarve:
+            FreeCAD.Console.PrintError(
+                translate("Path_Vcarve",
+                    "This Engraver doesn't support Vcarve.") + "\n")
             return
 
         try:
@@ -330,7 +342,7 @@ class ObjectVcarve(PathEngraveBase.ObjectOp):
                         faces.extend(model.Shape.Faces)
 
             if faces:
-                self.buildPathMedial(obj, faces)
+                self.buildPathMedial(obj, width_to_depth_calculator, faces)
             else:
                 PathLog.error(translate('PathVcarve', 'The Job Base Object has no engraveable element. Engraving operation will produce no output.'))
 
@@ -357,7 +369,11 @@ class ObjectVcarve(PathEngraveBase.ObjectOp):
 
     def isToolSupported(self, obj, tool):
         '''isToolSupported(obj, tool) ... returns True if v-carve op can work with tool.'''
-        return hasattr(tool, 'Diameter') and hasattr(tool, 'CuttingEdgeAngle') and hasattr(tool, 'TipDiameter')
+
+        width_to_depth_calculator = \
+            PathWidthToDepth.WidthToDepthCalculator(tool, tool.BitShape)
+        return width_to_depth_calculator.SupportsVcarve
+
 
 def SetupProperties():
     return ["Discretize"]

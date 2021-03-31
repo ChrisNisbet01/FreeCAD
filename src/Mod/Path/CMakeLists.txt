@@ -136,6 +136,7 @@ SET(PathScripts_SRCS
     PathScripts/PathVcarveGui.py
     PathScripts/PathWaterline.py
     PathScripts/PathWaterlineGui.py
+    PathScripts/PathWidthToDepth.py
     PathScripts/PostUtils.py
     PathScripts/__init__.py
 )
